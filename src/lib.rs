@@ -7,10 +7,15 @@
 
 #![deny(missing_docs)]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Deref;
 
-use failure::Error;
+use thiserror::Error;
+
+use sections::file_header_section::FileHeaderSectionError;
+use sections::image_data_section::ImageDataSectionError;
+use sections::image_resources_section::ImageResourcesSectionError;
+use sections::layer_and_mask_information_section::layer::PsdLayerError;
 
 use crate::psd_channel::IntoRgba;
 pub use crate::psd_channel::{PsdChannelCompression, PsdChannelKind};
@@ -18,8 +23,8 @@ pub use crate::sections::file_header_section::{ColorMode, PsdDepth};
 use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::image_data_section::ImageDataSection;
 pub use crate::sections::image_resources_section::ImageResource;
+use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
-use crate::sections::image_resources_section::{DescriptorStructure, ImageResourcesSection};
 pub use crate::sections::layer_and_mask_information_section::layer::PsdGroup;
 pub use crate::sections::layer_and_mask_information_section::layer::PsdLayer;
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
@@ -29,7 +34,28 @@ use self::sections::file_header_section::FileHeaderSection;
 
 mod blend;
 mod psd_channel;
+mod render;
 mod sections;
+
+/// An list of errors returned when processing PSD file.
+///
+/// This list is intended to grow over time and it is not recommended to exhaustively match against it.
+#[derive(PartialEq, Debug, Error)]
+#[non_exhaustive]
+pub enum PsdError {
+    /// Failed to parse PSD header
+    #[error("Failed to parse PSD header: '{0}'.")]
+    HeaderError(FileHeaderSectionError),
+    /// Failed to parse PSD layer
+    #[error("Failed to parse PSD layer: '{0}'.")]
+    LayerError(PsdLayerError),
+    /// Failed to parse PSD data section
+    #[error("Failed to parse PSD data section: '{0}'.")]
+    ImageError(ImageDataSectionError),
+    /// Failed to parse PSD resource section
+    #[error("Failed to parse PSD resource section: '{0}'.")]
+    ResourceError(ImageResourcesSectionError),
+}
 
 /// Represents the contents of a PSD file
 ///
@@ -57,10 +83,11 @@ impl Psd {
     ///
     /// let psd = Psd::from_bytes(psd_bytes);
     /// ```
-    pub fn from_bytes(bytes: &[u8]) -> Result<Psd, Error> {
-        let major_sections = MajorSections::from_bytes(bytes)?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Psd, PsdError> {
+        let major_sections = MajorSections::from_bytes(bytes).map_err(PsdError::HeaderError)?;
 
-        let file_header_section = FileHeaderSection::from_bytes(major_sections.file_header)?;
+        let file_header_section = FileHeaderSection::from_bytes(major_sections.file_header)
+            .map_err(PsdError::HeaderError)?;
 
         let psd_width = file_header_section.width.0;
         let psd_height = file_header_section.height.0;
@@ -70,17 +97,20 @@ impl Psd {
             major_sections.layer_and_mask,
             psd_width,
             psd_height,
-        )?;
+        )
+        .map_err(PsdError::LayerError)?;
 
         let image_data_section = ImageDataSection::from_bytes(
             major_sections.image_data,
             file_header_section.depth,
             psd_height,
             channel_count,
-        )?;
+        )
+        .map_err(PsdError::ImageError)?;
 
         let image_resources_section =
-            ImageResourcesSection::from_bytes(major_sections.image_resources)?;
+            ImageResourcesSection::from_bytes(major_sections.image_resources)
+                .map_err(PsdError::ResourceError)?;
 
         Ok(Psd {
             file_header_section,
@@ -118,56 +148,46 @@ impl Psd {
 impl Psd {
     /// Get all of the layers in the PSD
     pub fn layers(&self) -> &Vec<PsdLayer> {
-        &self.layer_and_mask_information_section.layers.items()
+        &self.layer_and_mask_information_section.layers
     }
 
     /// Get a layer by name
-    pub fn layer_by_name(&self, name: &str) -> Result<&PsdLayer, Error> {
-        let item = self
-            .layer_and_mask_information_section
+    pub fn layer_by_name(&self, name: &str) -> Option<&PsdLayer> {
+        self.layer_and_mask_information_section
             .layers
             .item_by_name(name)
-            .unwrap();
-        Ok(item)
     }
 
     /// Get a layer by index.
     ///
     /// index 0 is the bottom layer, index 1 is the layer above that, etc
-    pub fn layer_by_idx(&self, idx: usize) -> Result<&PsdLayer, Error> {
-        let item = self
-            .layer_and_mask_information_section
+    pub fn layer_by_idx(&self, idx: usize) -> &PsdLayer {
+        self.layer_and_mask_information_section
             .layers
-            .item_by_idx(idx)
-            .unwrap();
-        Ok(item)
+            .get(idx)
+            .unwrap()
     }
 
-    /// Get a group by id.
-    pub fn group_by_id(&self, id: usize) -> Option<&PsdGroup> {
+    /// Get all of the groups in the PSD, in the order that they appear in the PSD file.
+    pub fn groups(&self) -> &HashMap<u32, PsdGroup> {
+        &self.layer_and_mask_information_section.groups
+    }
+
+    /// Get the group ID's in the order that they appear in Photoshop.
+    /// (i.e. from the bottom of layers view to the top of the layers view).
+    pub fn group_ids_in_order(&self) -> &Vec<u32> {
         self.layer_and_mask_information_section
             .groups
-            .item_by_idx(id)
-    }
-
-    /// Get a group by name
-    pub fn group_by_name(&self, name: &str) -> Option<&PsdGroup> {
-        self.layer_and_mask_information_section
-            .groups
-            .item_by_name(name)
-    }
-
-    /// Get all of the groups in the PSD
-    pub fn groups(&self) -> &Vec<PsdGroup> {
-        &self.layer_and_mask_information_section.groups.items()
+            .group_ids_in_order()
     }
 
     /// Returns sub layers of group by group id
-    pub fn get_sub_layers(&self, id: usize) -> Option<&[PsdLayer]> {
-        match self.group_by_id(id) {
-            Some(group) => {
-                Some(&self.layer_and_mask_information_section.layers[&group.contained_layers])
-            }
+    pub fn get_group_sub_layers(&self, id: &u32) -> Option<&[PsdLayer]> {
+        match self.groups().get(id) {
+            Some(group) => Some(
+                &self.layer_and_mask_information_section.layers.deref()
+                    [group.contained_layers.clone()],
+            ),
             None => None,
         }
     }
@@ -185,7 +205,7 @@ impl Psd {
     pub fn flatten_layers_rgba(
         &self,
         filter: &dyn Fn((usize, &PsdLayer)) -> bool,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Vec<u8>, PsdError> {
         // When you create a PSD but don't create any new layers the bottom layer might not
         // show up in the layer and mask information section, so we won't see any layers.
         //
@@ -197,19 +217,20 @@ impl Psd {
         }
 
         // Filter out layers based on the passed in filter.
-        let layers_to_flatten_top_to_bottom: Vec<(usize, &PsdLayer)> = self
+        let layers_to_flatten_top_down: Vec<&PsdLayer> = self
             .layers()
             .iter()
             .enumerate()
             // here we filter transparent layers and invisible layers
             .filter(|(_, layer)| (layer.opacity > 0 && layer.visible) || layer.clipping_mask)
             .filter(|(idx, layer)| filter((*idx, layer)))
+            .map(|(_, layer)| layer)
             .collect();
 
         let pixel_count = self.width() * self.height();
 
         // If there aren't any layers left after filtering we return a complete transparent image.
-        if layers_to_flatten_top_to_bottom.is_empty() {
+        if layers_to_flatten_top_down.is_empty() {
             return Ok(vec![0; pixel_count as usize * 4]);
         }
 
@@ -218,7 +239,7 @@ impl Psd {
         //
         // Anytime we need to calculate the RGBA for a layer we cache it so that we don't need
         // to perform that operation again.
-        let cached_layer_rgba = RefCell::new(HashMap::new());
+        let renderer = render::Renderer::new(&layers_to_flatten_top_down, self.width() as usize);
 
         let mut flattened_pixels = Vec::with_capacity((pixel_count * 4) as usize);
 
@@ -229,12 +250,7 @@ impl Psd {
             let top = pixel_idx / self.width() as usize;
             let pixel_coord = (left, top);
 
-            let blended_pixel = self.flattened_pixel(
-                0,
-                pixel_coord,
-                &layers_to_flatten_top_to_bottom,
-                &cached_layer_rgba,
-            );
+            let blended_pixel = renderer.flattened_pixel(pixel_coord);
 
             flattened_pixels.push(blended_pixel[0]);
             flattened_pixels.push(blended_pixel[1]);
@@ -244,98 +260,6 @@ impl Psd {
 
         Ok(flattened_pixels)
     }
-
-    /// Get the pixel at a coordinate within this image.
-    ///
-    /// If that pixel has transparency, recursively blending it with the pixel
-    /// below it until we reach a pixel with no transparency or the bottom of the stack.
-    fn flattened_pixel(
-        &self,
-        // Top is 0, below that is 1, ... etc
-        flattened_layer_top_down_idx: usize,
-        // (left, top)
-        pixel_coord: (usize, usize),
-        layers_to_flatten_top_down: &[(usize, &PsdLayer)],
-        cached_layer_rgba: &RefCell<HashMap<usize, Vec<u8>>>,
-    ) -> [u8; 4] {
-        let layer = layers_to_flatten_top_down[flattened_layer_top_down_idx].1;
-
-        let (pixel_left, pixel_top) = pixel_coord;
-
-        // If this pixel is out of bounds of this layer we return the pixel below it.
-        // If there is no pixel below it we return a transparent pixel
-        if pixel_left < layer.layer_properties.layer_left as usize
-            || pixel_left > layer.layer_properties.layer_right as usize
-            || pixel_top < layer.layer_properties.layer_top as usize
-            || pixel_top > layer.layer_properties.layer_bottom as usize
-        {
-            if flattened_layer_top_down_idx + 1 < layers_to_flatten_top_down.len() {
-                return self.flattened_pixel(
-                    flattened_layer_top_down_idx + 1,
-                    pixel_coord,
-                    layers_to_flatten_top_down,
-                    cached_layer_rgba,
-                );
-            } else {
-                return [0; 4];
-            }
-        }
-
-        // If we haven't already calculated the RGBA for this layer, calculate and cache it
-        if cached_layer_rgba
-            .borrow()
-            .get(&flattened_layer_top_down_idx)
-            .is_none()
-        {
-            let pixels = layers_to_flatten_top_down[flattened_layer_top_down_idx]
-                .1
-                .rgba()
-                .unwrap();
-            cached_layer_rgba
-                .borrow_mut()
-                .insert(flattened_layer_top_down_idx, pixels);
-        }
-
-        let pixel = {
-            let cache = cached_layer_rgba.borrow();
-            let layer_rgba = cache.get(&flattened_layer_top_down_idx).unwrap();
-
-            let pixel_idx = ((self.width() as usize * pixel_top) + pixel_left) * 4;
-
-            let (start, end) = (pixel_idx, pixel_idx + 4);
-
-            let pixel = &layer_rgba[start..end];
-            let mut copy = [0; 4];
-            copy.copy_from_slice(pixel);
-
-            blend::apply_opacity(&mut copy, layer.opacity);
-            copy
-        };
-
-        // This pixel is fully opaque, return it
-        let pixel = if pixel[3] == 255 && layer.opacity == 255 {
-            pixel
-        } else {
-            // If this pixel has some transparency, blend it with the layer below it
-            if flattened_layer_top_down_idx + 1 < layers_to_flatten_top_down.len() {
-                let mut final_pixel = [0; 4];
-                // This pixel has some transparency and there is a pixel below it, blend them
-                let pixel_below = self.flattened_pixel(
-                    flattened_layer_top_down_idx + 1,
-                    pixel_coord,
-                    layers_to_flatten_top_down,
-                    cached_layer_rgba,
-                );
-
-                blend::blend_pixels(pixel, pixel_below, layer.blend_mode, &mut final_pixel);
-                final_pixel
-            } else {
-                // There is no pixel below this layer, so use it even though it has transparency
-                pixel
-            }
-        };
-        pixel
-    }
 }
 
 // Methods for working with the final flattened image data
@@ -343,7 +267,7 @@ impl Psd {
     /// Get the RGBA pixels for the PSD
     /// [ R,G,B,A, R,G,B,A, R,G,B,A, ...]
     pub fn rgba(&self) -> Vec<u8> {
-        self.generate_rgba().unwrap()
+        self.generate_rgba()
     }
 
     /// Get the compression level for the flattened image data
@@ -409,8 +333,10 @@ mod tests {
         let psd = include_bytes!("../tests/fixtures/green-1x1.png");
 
         let err = Psd::from_bytes(psd).expect_err("Psd::from_bytes() didn't catch the PNG file");
-        let err = err.downcast_ref::<FileHeaderSectionError>();
 
-        assert_eq!(err, Some(&FileHeaderSectionError::InvalidSignature {}));
+        assert_eq!(
+            err,
+            PsdError::HeaderError(FileHeaderSectionError::InvalidSignature {})
+        );
     }
 }
